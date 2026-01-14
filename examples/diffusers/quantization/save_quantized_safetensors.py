@@ -14,6 +14,165 @@ from safetensors.torch import save_file
 from modelopt.torch.quantization.qtensor import FP8QTensor, NVFP4QTensor, QTensorWrapper
 
 
+F4_E2M1_MAX = 6.0
+F8_E4M3_MAX = 448.0
+
+
+def _n_ones(bits: int) -> int:
+    return (1 << bits) - 1
+
+
+def _roundup(x: int, multiple: int) -> int:
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+def _float8_round(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.float8_e4m3fn).to(torch.float32)
+
+
+def _f32_to_floatx_unpacked(x: torch.Tensor, ebits: int, mbits: int) -> torch.Tensor:
+    assert x.dtype == torch.float
+    assert 1 + ebits + mbits <= 8
+
+    f32_exp_bias = _n_ones(8 - 1)
+    max_int = _n_ones(ebits + mbits)
+    sign_mask = 1 << (ebits + mbits)
+    magic_adder = _n_ones(23 - mbits - 1)
+
+    max_normal = 2 ** (_n_ones(ebits) - _n_ones(ebits - 1)) * (
+        _n_ones(mbits + 1) / (2**mbits)
+    )
+    min_normal = 2 ** (1 - _n_ones(ebits - 1))
+
+    denorm_exp = (
+        (f32_exp_bias - _n_ones(ebits - 1))
+        + (23 - mbits)
+        + 1
+    )
+    denorm_mask_int = denorm_exp << 23
+    denorm_mask_float = torch.tensor(denorm_mask_int, dtype=torch.int32).view(torch.float32)
+
+    x_int = x.view(torch.int32)
+    sign = x_int & 0x80000000
+    x_int = x_int ^ sign
+    x_pos = x_int.view(torch.float)
+
+    saturate_mask = x_pos >= max_normal
+    denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), x_pos < min_normal)
+    normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
+
+    denormal_x = x_pos + denorm_mask_float
+    denormal_x = denormal_x.view(torch.int32)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(torch.uint8)
+
+    normal_x = x_pos.view(torch.int32)
+    mant_odd = (normal_x >> (23 - mbits)) & 1
+    val_to_add = ((_n_ones(ebits - 1) - f32_exp_bias) << 23) + magic_adder
+    normal_x += val_to_add
+    normal_x += mant_odd
+    normal_x = normal_x >> (23 - mbits)
+    normal_x = normal_x.to(torch.uint8)
+
+    out = torch.full_like(x_pos, max_int, dtype=torch.uint8)
+    out = torch.where(denormal_mask, denormal_x, out)
+    out = torch.where(normal_mask, normal_x, out)
+
+    sign_lp = sign >> (23 + 8 - mbits - ebits)
+    sign_lp = sign_lp.to(torch.uint8)
+    sign_lp = sign_lp & sign_mask
+    out = out | sign_lp
+
+    return out.to(torch.uint8)
+
+
+def _down_size(size: tuple[int, ...]) -> tuple[int, ...]:
+    return (*size[:-1], size[-1] // 2)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
+    shape = uint8_data.shape
+    assert shape[-1] % 2 == 0
+    flat = uint8_data.contiguous().view(-1)
+    return (flat[::2] << 4 | flat[1::2]).view(_down_size(shape))
+
+
+def _to_blocked(input_matrix: torch.Tensor) -> torch.Tensor:
+    rows, cols = input_matrix.shape
+    n_row_blocks = _ceil_div(rows, 128)
+    n_col_blocks = _ceil_div(cols, 4)
+
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    padded = input_matrix
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = torch.zeros(
+            (padded_rows, padded_cols),
+            device=input_matrix.device,
+            dtype=input_matrix.dtype,
+        )
+        padded[:rows, :cols] = input_matrix
+
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    return rearranged.reshape(padded_rows, padded_cols)
+
+
+def _nvfp4_quantize_comfy(weight: torch.Tensor):
+    if weight.dim() != 2:
+        raise ValueError("NVFP4 requires 2D tensor")
+    weight = weight.contiguous()
+
+    rows, cols = weight.shape
+    padded_rows = _roundup(rows, 16)
+    padded_cols = _roundup(cols, 16)
+    if padded_rows != rows or padded_cols != cols:
+        weight = torch.nn.functional.pad(
+            weight, (0, padded_cols - cols, 0, padded_rows - rows)
+        )
+        rows, cols = weight.shape
+
+    max_abs = weight.abs().max()
+    per_tensor_scale = max_abs.float() / (F8_E4M3_MAX * F4_E2M1_MAX)
+    if per_tensor_scale.numel() == 0 or per_tensor_scale.item() == 0.0:
+        per_tensor_scale = torch.tensor(1.0, device=weight.device, dtype=torch.float32)
+
+    block_size = 16
+    blocks = weight.reshape(rows, -1, block_size)
+    max_block = torch.amax(torch.abs(blocks), dim=-1)
+    block_scale = max_block.to(torch.float32) / F4_E2M1_MAX
+    scaled_block_scales = block_scale / per_tensor_scale
+    scaled_block_scales = torch.clamp(scaled_block_scales, max=F8_E4M3_MAX)
+    scaled_block_scales_fp8 = scaled_block_scales.to(torch.float8_e4m3fn)
+    scaled_block_scales_fp32 = _float8_round(scaled_block_scales_fp8)
+
+    total_scale = per_tensor_scale * scaled_block_scales_fp32
+    zero_mask = total_scale == 0
+    total_scale_safe = torch.where(
+        zero_mask, torch.ones_like(total_scale), total_scale
+    )
+
+    data_scaled = blocks.float() / total_scale_safe.unsqueeze(-1)
+    if zero_mask.any():
+        data_scaled = torch.where(
+            zero_mask.unsqueeze(-1), torch.zeros_like(data_scaled), data_scaled
+        )
+
+    data_scaled = torch.clamp(data_scaled, -F4_E2M1_MAX, F4_E2M1_MAX)
+    data_scaled = data_scaled.view(rows, cols)
+
+    data_lp = _f32_to_floatx_unpacked(data_scaled, 2, 1)
+    qdata = _pack_uint4(data_lp)
+    block_scales = _to_blocked(scaled_block_scales_fp8)
+
+    return qdata, block_scales, per_tensor_scale
+
+
 def _is_quantizer_key(key: str) -> bool:
     return any(
         pattern in key
@@ -348,16 +507,8 @@ def _quantize_weight_from_float(
     weight: torch.Tensor, fmt: str, block_size: int | None
 ):
     if fmt == "nvfp4":
-        if block_size is None:
-            block_size = 16
-        q_tensor, weight_scale, weight_scale_2 = NVFP4QTensor.quantize(
-            weight,
-            block_size,
-            weights_scaling_factor_2=None,
-            keep_high_precision=False,
-            try_tensorrt=False,
-        )
-        return q_tensor._quantized_data, weight_scale, weight_scale_2
+        qdata, block_scales, per_tensor_scale = _nvfp4_quantize_comfy(weight)
+        return qdata, block_scales, per_tensor_scale
 
     if fmt == "float8_e4m3fn":
         q_tensor, weight_scale = FP8QTensor.quantize(
@@ -451,9 +602,14 @@ def _build_comfy_state_dict(backbone: torch.nn.Module, logger: logging.Logger):
             continue
 
         try:
-            q_weight, weight_scale, weight_scale_2 = _quantize_weight(
-                weight.detach(), weight_quantizer, layer_name, fmt
-            )
+            if fmt == "nvfp4":
+                q_weight, weight_scale, weight_scale_2 = _nvfp4_quantize_comfy(
+                    weight.detach()
+                )
+            else:
+                q_weight, weight_scale, weight_scale_2 = _quantize_weight(
+                    weight.detach(), weight_quantizer, layer_name, fmt
+                )
         except Exception as exc:
             skipped_layers += 1
             logger.warning(f"Skipping layer {layer_name}: {exc}")
@@ -501,7 +657,7 @@ def save_quantized_safetensors(
 
     logger.info("=" * 80)
     logger.info("USING FIXED SAFETENSORS SAVER - ComfyUI export enabled")
-    logger.info("Version: 2026-01-14-v4 (Flux ComfyUI mapping + quant)")
+    logger.info("Version: 2026-01-14-v5 (Comfy NVFP4 scale layout)")
     logger.info("=" * 80)
 
     logger.info("Extracting quantized weights and scales from backbone...")
