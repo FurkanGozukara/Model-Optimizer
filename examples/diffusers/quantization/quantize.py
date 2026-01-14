@@ -72,6 +72,7 @@ from utils import (
     filter_func_wan_video,
     load_calib_prompts,
 )
+from save_quantized_safetensors import save_quantized_safetensors
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
@@ -361,6 +362,7 @@ class ExportConfig:
     quantized_torch_ckpt_path: Path | None = None
     onnx_dir: Path | None = None
     restore_from: Path | None = None
+    save_safetensors: bool = True  # NEW: Save SafeTensors directly
 
     def validate(self) -> None:
         """Validate export configuration."""
@@ -1155,16 +1157,20 @@ class Quantizer:
 class ExportManager:
     """Handles model export operations."""
 
-    def __init__(self, config: ExportConfig, logger: logging.Logger):
+    def __init__(self, config: ExportConfig, logger: logging.Logger, quant_format: str = "fp4", quant_algo: str = "max"):
         """
         Initialize export manager.
 
         Args:
             config: Export configuration
             logger: Logger instance
+            quant_format: Quantization format for metadata
+            quant_algo: Quantization algorithm for metadata
         """
         self.config = config
         self.logger = logger
+        self.quant_format = quant_format
+        self.quant_algo = quant_algo
 
     def _has_conv_layers(self, model: torch.nn.Module) -> bool:
         """
@@ -1185,7 +1191,7 @@ class ExportManager:
 
     def save_checkpoint(self, backbone: torch.nn.Module) -> None:
         """
-        Save quantized model checkpoint.
+        Save quantized model checkpoint with ComfyUI-compatible metadata.
 
         Args:
             backbone: Model backbone to save
@@ -1200,8 +1206,9 @@ class ExportManager:
         self.logger.info(f"💾 Path exists (parent): {self.config.quantized_torch_ckpt_path.parent.exists()}")
 
         try:
+            # Save ModelOpt .pt checkpoint
             mto.save(backbone, str(self.config.quantized_torch_ckpt_path))
-            self.logger.info("✅ Checkpoint saved successfully")
+            self.logger.info("✅ ModelOpt checkpoint saved successfully")
 
             # Verify the file was actually created
             import os
@@ -1210,6 +1217,29 @@ class ExportManager:
                 self.logger.info(f"✅ File verified: {file_size:.2f} GB")
             else:
                 self.logger.error(f"❌ File was not created: {self.config.quantized_torch_ckpt_path}")
+                return
+
+            # Also save as SafeTensors with proper metadata for ComfyUI
+            if self.config.save_safetensors:
+                safetensors_path = self.config.quantized_torch_ckpt_path.with_suffix('.safetensors')
+                self.logger.info(f"")
+                self.logger.info(f"📦 Saving SafeTensors format for ComfyUI compatibility...")
+
+                # Map quant format
+                quant_format_str = "nvfp4" if self.quant_format == "fp4" else "float8_e4m3fn"
+
+                try:
+                    save_quantized_safetensors(
+                        backbone,
+                        safetensors_path,
+                        quant_format=quant_format_str,
+                        quant_algo=self.quant_algo,
+                        logger=self.logger
+                    )
+                except Exception as e:
+                    self.logger.error(f"❌ SafeTensors save failed: {e}")
+                    self.logger.warning("⚠️ ModelOpt .pt file is still available")
+
         except Exception as e:
             self.logger.error(f"❌ Save failed with error: {e}")
             raise
@@ -1517,7 +1547,12 @@ def main() -> None:
         pipeline_manager.setup_device()
 
         backbone = pipeline_manager.get_backbone()
-        export_manager = ExportManager(export_config, logger)
+        export_manager = ExportManager(
+            export_config,
+            logger,
+            quant_format=quant_config.format.value,
+            quant_algo=quant_config.algo.value
+        )
 
         if export_config.restore_from and export_config.restore_from.exists():
             export_manager.restore_checkpoint(backbone)
