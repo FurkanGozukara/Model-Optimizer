@@ -100,12 +100,17 @@ NVFP4_FP8_MHA_CONFIG = {
 }
 
 # FLUX Dev mixed-format layers derived from official NVFP4 metadata.
+# These patterns target diffusers module names (pre-export), not ComfyUI names.
 FLUX_DEV_FP8_LAYER_PATTERNS = [
-    "double_blocks.*.img_attn.qkv",
-    "double_blocks.*.img_mod.lin",
-    "double_blocks.*.txt_attn.qkv",
-    "double_blocks.*.txt_mod.lin",
-    "single_blocks.*.modulation.lin",
+    "transformer_blocks.*.attn.to_q",
+    "transformer_blocks.*.attn.to_k",
+    "transformer_blocks.*.attn.to_v",
+    "transformer_blocks.*.attn.add_q_proj",
+    "transformer_blocks.*.attn.add_k_proj",
+    "transformer_blocks.*.attn.add_v_proj",
+    "transformer_blocks.*.norm1.linear",
+    "transformer_blocks.*.norm1_context.linear",
+    "single_transformer_blocks.*.norm.linear",
 ]
 
 
