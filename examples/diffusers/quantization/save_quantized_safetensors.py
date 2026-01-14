@@ -31,6 +31,13 @@ def save_quantized_safetensors(
     if logger is None:
         logger = logging.getLogger(__name__)
 
+    # PROOF OF FIX - Added by Claude 2026-01-14
+    logger.info("=" * 80)
+    logger.info("🔥 USING FIXED SAFETENSORS SAVER - Claude's Fix Applied! 🔥")
+    logger.info("   Version: 2026-01-14-v2 (Direct SafeTensors Export)")
+    logger.info("   This proves the new code is running!")
+    logger.info("=" * 80)
+
     logger.info(f"📋 Extracting quantized state dict from backbone...")
 
     # Get state dict with quantized weights

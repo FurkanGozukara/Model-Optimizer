@@ -1223,6 +1223,11 @@ class ExportManager:
             if self.config.save_safetensors:
                 safetensors_path = self.config.quantized_torch_ckpt_path.with_suffix('.safetensors')
                 self.logger.info(f"")
+                self.logger.info("=" * 80)
+                self.logger.info("🚀 CLAUDE'S FIX: Starting SafeTensors export with metadata!")
+                self.logger.info(f"   Fix applied: 2026-01-14 @ 14:20 UTC+3")
+                self.logger.info(f"   Target file: {safetensors_path.name}")
+                self.logger.info("=" * 80)
                 self.logger.info(f"📦 Saving SafeTensors format for ComfyUI compatibility...")
 
                 # Map quant format
