@@ -212,7 +212,14 @@ def _get_input_scale(input_quantizer):
     maxbound = getattr(input_quantizer, "maxbound", None)
     if maxbound is None:
         return None
-    scale = amax.float() / (maxbound * 448.0)
+    # NVFP4 uses an additional FP8 scaling factor; FP8/INT8 use maxbound directly.
+    num_bits = getattr(input_quantizer, "num_bits", None)
+    block_sizes = getattr(input_quantizer, "block_sizes", None) or {}
+    is_nvfp4 = num_bits == (2, 1) and block_sizes.get("scale_bits") == (4, 3)
+    if is_nvfp4:
+        scale = amax.float() / (maxbound * 448.0)
+    else:
+        scale = amax.float() / maxbound
     if scale.numel() == 1:
         scale = scale.squeeze()
     return scale
