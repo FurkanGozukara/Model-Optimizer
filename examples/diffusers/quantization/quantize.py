@@ -1191,11 +1191,28 @@ class ExportManager:
             backbone: Model backbone to save
         """
         if not self.config.quantized_torch_ckpt_path:
+            self.logger.warning("⚠️ quantized_torch_ckpt_path is None or empty! Skipping save.")
+            self.logger.warning(f"⚠️ Config: {self.config}")
             return
 
-        self.logger.info(f"Saving quantized checkpoint to {self.config.quantized_torch_ckpt_path}")
-        mto.save(backbone, str(self.config.quantized_torch_ckpt_path))
-        self.logger.info("Checkpoint saved successfully")
+        self.logger.info(f"💾 Saving quantized checkpoint to {self.config.quantized_torch_ckpt_path}")
+        self.logger.info(f"💾 Path type: {type(self.config.quantized_torch_ckpt_path)}")
+        self.logger.info(f"💾 Path exists (parent): {self.config.quantized_torch_ckpt_path.parent.exists()}")
+
+        try:
+            mto.save(backbone, str(self.config.quantized_torch_ckpt_path))
+            self.logger.info("✅ Checkpoint saved successfully")
+
+            # Verify the file was actually created
+            import os
+            if os.path.exists(str(self.config.quantized_torch_ckpt_path)):
+                file_size = os.path.getsize(str(self.config.quantized_torch_ckpt_path)) / (1024**3)
+                self.logger.info(f"✅ File verified: {file_size:.2f} GB")
+            else:
+                self.logger.error(f"❌ File was not created: {self.config.quantized_torch_ckpt_path}")
+        except Exception as e:
+            self.logger.error(f"❌ Save failed with error: {e}")
+            raise
 
     def export_onnx(
         self,
@@ -1466,6 +1483,14 @@ def main() -> None:
             n_steps=args.n_steps,
         )
 
+        # DEBUG: Log the parsed arguments
+        logger.info("=" * 80)
+        logger.info("🔍 EXPORT CONFIGURATION DEBUG")
+        logger.info(f"   args.quantized_torch_ckpt_save_path = {args.quantized_torch_ckpt_save_path}")
+        logger.info(f"   Type: {type(args.quantized_torch_ckpt_save_path)}")
+        logger.info(f"   Truthy: {bool(args.quantized_torch_ckpt_save_path)}")
+        logger.info("=" * 80)
+
         export_config = ExportConfig(
             quantized_torch_ckpt_path=Path(args.quantized_torch_ckpt_save_path)
             if args.quantized_torch_ckpt_save_path
@@ -1473,6 +1498,13 @@ def main() -> None:
             onnx_dir=Path(args.onnx_dir) if args.onnx_dir else None,
             restore_from=Path(args.restore_from) if args.restore_from else None,
         )
+
+        # DEBUG: Log the created config
+        logger.info("=" * 80)
+        logger.info("🔍 CREATED EXPORT CONFIG")
+        logger.info(f"   export_config.quantized_torch_ckpt_path = {export_config.quantized_torch_ckpt_path}")
+        logger.info(f"   Type: {type(export_config.quantized_torch_ckpt_path)}")
+        logger.info("=" * 80)
 
         logger.info("Validating configurations...")
         quant_config.validate()
