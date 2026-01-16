@@ -77,6 +77,7 @@ from save_quantized_safetensors import save_quantized_safetensors
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
+from modelopt.torch.export import export_hf_checkpoint
 
 
 class ModelType(str, Enum):
@@ -363,6 +364,7 @@ class ExportConfig:
 
     quantized_torch_ckpt_path: Path | None = None
     onnx_dir: Path | None = None
+    hf_ckpt_dir: Path | None = None
     restore_from: Path | None = None
     save_safetensors: bool = True  # NEW: Save SafeTensors directly
 
@@ -378,6 +380,9 @@ class ExportConfig:
 
         if self.onnx_dir and not self.onnx_dir.exists():
             self.onnx_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.hf_ckpt_dir and not self.hf_ckpt_dir.exists():
+            self.hf_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -1317,6 +1322,20 @@ class ExportManager:
         mto.restore(backbone, str(self.config.restore_from))
         self.logger.info("Model restored successfully")
 
+    def export_hf_ckpt(self, pipe: DiffusionPipeline) -> None:
+        """
+        Export quantized model to HuggingFace checkpoint format.
+
+        Args:
+            pipe: Diffusion pipeline containing the quantized model
+        """
+        if not self.config.hf_ckpt_dir:
+            return
+
+        self.logger.info(f"Exporting HuggingFace checkpoint to {self.config.hf_ckpt_dir}")
+        export_hf_checkpoint(pipe, export_dir=self.config.hf_ckpt_dir)
+        self.logger.info("HuggingFace checkpoint export completed successfully")
+
 
 def create_argument_parser() -> argparse.ArgumentParser:
     """
@@ -1459,6 +1478,11 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     export_group.add_argument("--onnx-dir", type=str, help="Directory for ONNX export")
     export_group.add_argument(
+        "--hf-ckpt-dir",
+        type=str,
+        help="Directory for HuggingFace checkpoint export",
+    )
+    export_group.add_argument(
         "--restore-from", type=str, help="Path to restore from previous checkpoint"
     )
     export_group.add_argument(
@@ -1545,6 +1569,7 @@ def main() -> None:
             if args.quantized_torch_ckpt_save_path
             else None,
             onnx_dir=Path(args.onnx_dir) if args.onnx_dir else None,
+            hf_ckpt_dir=Path(args.hf_ckpt_dir) if args.hf_ckpt_dir else None,
             restore_from=Path(args.restore_from) if args.restore_from else None,
         )
 
@@ -1611,6 +1636,9 @@ def main() -> None:
             model_config.model_type,
             quant_config.format,
         )
+
+        export_manager.export_hf_ckpt(pipe)
+
         logger.info(
             f"Quantization process completed successfully! Time taken = {time.time() - s} seconds"
         )
